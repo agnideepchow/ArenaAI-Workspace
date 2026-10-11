@@ -22,6 +22,7 @@
       </div>
     </div>
     <div class="top-actions">
+      <span class="feed" id="feedChip" title="Live environmental feed"><i></i><span>Connecting live feed…</span></span>
       <div class="clock" id="clock">--:--:--</div>
       <label class="live"><input type="checkbox" id="liveToggle" /><span class="track"><b></b></span><em>Live</em></label>
       <button class="btn" id="tickBtn">+1 hour</button>
@@ -75,11 +76,32 @@
           <div><b>Safety index (0–100)</b><span>Penalties for pH, turbidity, dissolved O₂, chlorine residual, and E. coli, using BIS IS 10500 / WHO limits. Any E. coli caps the score below 60.</span></div>
           <div><b>Outbreak risk (0–100)</b><span>Faecal indicator load, lost chlorine residual, turbidity, population exposed, and rainfall, as an early-warning heuristic.</span></div>
           <div><b>Leak index (0–100)</b><span>Flow against the expected day/night demand curve, plus pressure sag below baseline.</span></div>
+          <div><b>Data sources</b><span>Weather, rainfall and river discharge are live from Open-Meteo. Sensor parameters (pH, chlorine, E. coli and so on) are simulated until a device or utility feed is connected through <code class="code">POST /api/ingest</code>.</span></div>
           <p class="fine">Demo data is simulated from realistic Tamil Nadu baselines. Scores support decisions and do not replace accredited lab testing.</p>
         </div>
       </div>
     </section>
   </main>
+
+  <!-- AI assistant -->
+  <button class="chat-fab" id="chatFab" aria-label="Open AI assistant"><span>✦</span> Ask AquaPulse</button>
+  <section class="chat-panel glass" id="chatPanel" aria-hidden="true">
+    <header class="chat-head">
+      <div class="chat-title"><div class="chat-avatar">✦</div><div><b>AquaPulse Assistant</b><small id="chatModel">Gemini · grounded in live data</small></div></div>
+      <button class="icon-btn" id="chatClose" aria-label="Close">✕</button>
+    </header>
+    <div class="chat-body" id="chatBody"></div>
+    <div class="chat-suggest" id="chatSuggest">
+      <button>Which sources are unsafe right now?</button>
+      <button>Is there any leak or flood risk?</button>
+      <button>What should a field operator do about low chlorine?</button>
+      <button>Summarise today's network health for a judge</button>
+    </div>
+    <form class="chat-input" id="chatForm">
+      <input id="chatText" type="text" placeholder="Ask about any source, alert or reading…" maxlength="800" autocomplete="off" />
+      <button class="btn sm" type="submit" id="chatSend">Send</button>
+    </form>
+  </section>
 
   <div class="toast" id="toast"></div>
 

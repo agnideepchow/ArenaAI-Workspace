@@ -22,9 +22,18 @@ function toast(msg) {
 }
 
 /* ---------- map ---------- */
-function initMap() {
-  map = L.map("map", { zoomControl: false, attributionControl: false, scrollWheelZoom: false }).setView([10.6, 78.4], 7);
-  L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { maxZoom: 18 }).addTo(map);
+let appConfig = { geoapify_key: "", assistant_ready: false, assistant_model: "" };
+async function initMap() {
+  try { appConfig = await api("/api/config"); } catch (e) { console.warn(e); }
+  map = L.map("map", { zoomControl: false, scrollWheelZoom: false }).setView([10.6, 78.4], 7);
+  if (appConfig.geoapify_key) {
+    L.tileLayer(`https://maps.geoapify.com/v1/tile/dark-matter/{z}/{x}/{y}.png?apiKey=${encodeURIComponent(appConfig.geoapify_key)}`, {
+      maxZoom: 20,
+      attribution: '&copy; <a href="https://www.geoapify.com/">Geoapify</a> &copy; <a href="https://openmaptiles.org/">OpenMapTiles</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    }).addTo(map);
+  } else {
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { maxZoom: 18 }).addTo(map);
+  }
   L.control.zoom({ position: "bottomright" }).addTo(map);
 }
 function markerIcon(verdict, selected) {
@@ -92,6 +101,24 @@ function renderAlerts(alerts) {
   }));
 }
 
+function renderFeed(feed) {
+  const chip = $("#feedChip");
+  if (!feed) return;
+  chip.classList.toggle("ok", !!feed.ok);
+  chip.classList.toggle("err", !feed.ok);
+  const time = feed.updated ? new Date(feed.updated).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" }) : "";
+  chip.querySelector("span").textContent = feed.ok ? `Live · Open-Meteo · ${time}` : "Live feed offline · using simulation";
+  chip.title = feed.ok ? feed.source : (feed.error || "Live feed unavailable");
+}
+function liveLine(l) {
+  if (!l) return "";
+  const parts = [];
+  if (l.temperature != null) parts.push(`🌡 ${Math.round(l.temperature)}°C`);
+  if (l.rain_24h != null) parts.push(`🌧 ${l.rain_24h} mm / 24h`);
+  if (l.river_trend === "rising") parts.push("🌊 river rising");
+  return parts.length ? `<div class="live-line">${parts.join(" · ")}</div>` : "";
+}
+
 function renderSites(sites) {
   $("#siteGrid").innerHTML = sites.map((s) => {
     const e = s.eval;
@@ -107,6 +134,7 @@ function renderSites(sites) {
         <div class="mini"><span>Leak index</span><b style="color:${e.leak >= 50 ? "#f43f5e" : e.leak >= 25 ? "#fbbf24" : "#e6f1ff"}">${Math.round(e.leak)}</b></div>
       </div>
       ${sparkSvg(s.sparkline, e.verdict)}
+      ${liveLine(s.live)}
       ${sc}
     </article>`;
   }).join("");
@@ -117,6 +145,7 @@ async function loadOverview() {
   const data = await api("/api/overview");
   scenarios = data.scenarios;
   lastSites = data.sites;
+  renderFeed(data.feed);
   renderKpis(data.kpis);
   updateMarkers(data.sites);
   renderAlerts(data.alerts);
@@ -165,7 +194,13 @@ async function selectSite(id, silent = false) {
     <div class="d-right">
       <div class="chart-head"><h3>Safety trend · last 72 h</h3><span class="muted">Chlorine &amp; turbidity overlay</span></div>
       <div class="chart-wrap"><canvas id="trend"></canvas></div>
-      <div><h3 style="margin-bottom:12px">Live parameters</h3><div class="params">${Object.values(e.params).map(paramTile).join("")}</div></div>
+      <div><h3 style="margin-bottom:12px">Sensor parameters <span class="live-tag" style="color:#fbbf24;background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.3)">SIMULATED</span></h3>
+        <div class="params">${Object.values(e.params).filter((p) => p.status !== "info").map(paramTile).join("")}</div></div>
+      ${data.live ? `<div><h3>Live conditions <span class="live-tag">LIVE · OPEN-METEO</span></h3><div class="live-tiles">
+        ${[["Temperature", data.live.temperature, "°C"], ["Rain now", data.live.rain_now, "mm"], ["Rain 24 h", data.live.rain_24h, "mm"],
+           ["River discharge", data.live.river_discharge, "m³/s"]].map(([l, v, u]) =>
+          `<div class="param info"><span>${l}</span><b>${v == null ? "–" : esc(v)}</b><small>${u}${l === "River discharge" && data.live.river_trend ? " · " + esc(data.live.river_trend) : ""}</small></div>`).join("")}
+        </div></div>` : ""}
       <div><h3 style="margin-bottom:12px">AI guidance</h3><div class="insights">${e.insights.map((i, n) =>
         `<div class="insight ${i.level}" style="animation-delay:${n * 0.08}s"><i></i><span>${esc(i.text)}</span></div>`).join("")}</div></div>
     </div>`;
@@ -261,9 +296,70 @@ function startClock() {
   tickClock(); setInterval(tickClock, 1000);
 }
 
+/* ---------- AI assistant ---------- */
+const chatHistory = [];
+function fmtMarkdown(text) {
+  const lines = esc(text).split("\n");
+  let html = "", inList = false;
+  for (const raw of lines) {
+    const line = raw.trim();
+    const bullet = /^[-*•]\s+(.*)/.exec(line);
+    if (bullet) {
+      if (!inList) { html += "<ul>"; inList = true; }
+      html += `<li>${bold(bullet[1])}</li>`;
+    } else {
+      if (inList) { html += "</ul>"; inList = false; }
+      if (line) html += `<p style="margin:0 0 6px">${bold(line)}</p>`;
+    }
+  }
+  if (inList) html += "</ul>";
+  return html;
+}
+function bold(s) { return s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>"); }
+function addMsg(role, text, extraClass = "") {
+  const el = document.createElement("div");
+  el.className = `msg ${role} ${extraClass}`;
+  el.innerHTML = role === "bot" || role === "error" ? (text.startsWith("<") ? text : fmtMarkdown(text)) : esc(text);
+  $("#chatBody").appendChild(el);
+  $("#chatBody").scrollTop = $("#chatBody").scrollHeight;
+  return el;
+}
+function openChat(open) {
+  $("#chatPanel").classList.toggle("open", open);
+  $("#chatPanel").setAttribute("aria-hidden", String(!open));
+  if (open) setTimeout(() => $("#chatText").focus(), 250);
+}
+async function sendChat(text) {
+  text = text.trim();
+  if (!text) return;
+  $("#chatSuggest").style.display = "none";
+  addMsg("user", text);
+  chatHistory.push({ role: "user", content: text });
+  $("#chatText").value = "";
+  const typing = addMsg("bot", `<span class="typing"><i></i><i></i><i></i></span>`);
+  $("#chatSend").disabled = true;
+  try {
+    const r = await api("/api/chat", { method: "POST", body: JSON.stringify({ messages: chatHistory }) });
+    typing.remove();
+    addMsg("bot", r.reply);
+    chatHistory.push({ role: "assistant", content: r.reply });
+  } catch (err) {
+    typing.remove();
+    addMsg("error", err.message, "error");
+    chatHistory.pop();
+  } finally {
+    $("#chatSend").disabled = false;
+  }
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   startClock();
-  initMap();
+  $("#chatFab").addEventListener("click", () => openChat(!$("#chatPanel").classList.contains("open")));
+  $("#chatClose").addEventListener("click", () => openChat(false));
+  $("#chatForm").addEventListener("submit", (e) => { e.preventDefault(); sendChat($("#chatText").value); });
+  document.querySelectorAll("#chatSuggest button").forEach((b) => b.addEventListener("click", () => sendChat(b.textContent)));
+  addMsg("bot", appConfigReadyMessage());
+  await initMap();
   $("#tickBtn").addEventListener("click", () => tick().then(() => toast("Advanced 1 simulated hour")).catch((e) => toast(e.message)));
   $("#resetBtn").addEventListener("click", () => reset().catch((e) => toast(e.message)));
   $("#liveToggle").addEventListener("change", (ev) => (ev.target.checked ? startLive() : stopLive()));
@@ -274,6 +370,14 @@ document.addEventListener("DOMContentLoaded", async () => {
   ["dragleave", "drop"].forEach((t) => dz.addEventListener(t, (e) => { e.preventDefault(); dz.classList.remove("over"); }));
   dz.addEventListener("drop", (e) => e.dataTransfer.files[0] && uploadFile(e.dataTransfer.files[0]));
 
+  if (!appConfig.assistant_ready) {
+    const note = $("#chatBody .msg");
+    if (note) note.innerHTML = fmtMarkdown("The assistant needs a **Gemini API key**. Add `GEMINI_API_KEY` to the `.env` file, then restart the server.");
+  }
   try { await loadOverview(); }
   catch (e) { toast("Could not load data: " + e.message); }
 });
+
+function appConfigReadyMessage() {
+  return "Hi! I'm the AquaPulse Assistant. Ask me about any source, alert or live condition. I answer from the current dashboard data.";
+}

@@ -133,7 +133,7 @@ def _status(key: str, value: float) -> str:
     return "bad"
 
 
-def evaluate(meta: dict, r: dict) -> dict:
+def evaluate(meta: dict, r: dict, live: dict | None = None) -> dict:
     """Score a single reading. Returns safety index, verdict, risks and explanations."""
     # --- Safety index (100 = pristine) ---
     penalty = 0.0
@@ -164,7 +164,11 @@ def evaluate(meta: dict, r: dict) -> dict:
     cl_t = min(20.0, max(0.0, 0.2 - cl) * 100)
     turb_t = min(15.0, max(0.0, r["turbidity"] - 1.0) * 2.5)
     pop_t = min(10.0, math.log10(meta["population"]) / 6 * 10)
-    rain_t = min(10.0, r.get("rainfall", 0.0))
+    rain24 = live.get("rain_24h") if live else None
+    if rain24 is not None:  # live Open-Meteo rainfall, last 24 h
+        rain_t = min(10.0, rain24 * 0.5)
+    else:
+        rain_t = min(10.0, r.get("rainfall", 0.0))
     outbreak = round(min(100.0, ecoli_t + cl_t + turb_t + pop_t + rain_t), 1)
 
     # --- Leak index (flow vs expected diurnal pattern + pressure sag) ---
@@ -220,6 +224,10 @@ def evaluate(meta: dict, r: dict) -> dict:
     elif outbreak >= 35:
         insights.append(dict(level="warn", text=(
             f"Outbreak risk is elevated ({outbreak:.0f}/100). Increase residual monitoring.")))
+    if live and live.get("river_trend") == "rising" and (rain24 or 0) >= 30:
+        insights.append(dict(level="warn", text=(
+            f"Live feed: {rain24} mm rain in 24 h and river discharge is rising. Flood watch: pre-position "
+            "chlorine and check intake screens.")))
     if not insights:
         insights.append(dict(level="ok", text="All measured parameters are inside safe limits. Keep routine sampling."))
 
@@ -241,6 +249,7 @@ class Network:
 
     def __init__(self, seed: int = 7):
         self.seed = seed
+        self.live: dict[str, dict] = {}
         self.reset()
 
     # ---- state management -------------------------------------------------
@@ -283,19 +292,26 @@ class Network:
         st["ticks_left"] = SCENARIOS[scenario]["ticks"]
 
     # ---- views ------------------------------------------------------------
+    def set_live(self, live: dict) -> None:
+        self.live = live
+
+    def _live(self, site_id: str) -> dict | None:
+        return self.live.get(site_id)
+
     def _latest(self, st: dict) -> dict:
         r = st["history"][-1]
-        return evaluate(st["meta"], r)
+        return evaluate(st["meta"], r, self._live(st["meta"]["id"]))
 
     def _site_card(self, st: dict) -> dict:
         meta = st["meta"]
         latest = self._latest(st)
-        spark = [evaluate(meta, r)["score"] for r in list(st["history"])[-24:]]
+        spark = [evaluate(meta, r, self._live(meta["id"]))["score"] for r in list(st["history"])[-24:]]
         scen = st["scenario"]
         return {**meta, "eval": latest, "sparkline": spark,
                 "scenario": {"id": scen, "label": SCENARIOS[scen]["label"],
                              "ticks_left": st["ticks_left"]} if scen else None,
-                "latest_timestamp": st["history"][-1]["timestamp"]}
+                "latest_timestamp": st["history"][-1]["timestamp"],
+                "live": self._live(meta["id"])}
 
     def alerts(self, limit: int = 14) -> list[dict]:
         out = []
@@ -303,7 +319,7 @@ class Network:
             meta = st["meta"]
             prev = None
             for r in list(st["history"])[-72:]:
-                ev = evaluate(meta, r)
+                ev = evaluate(meta, r, self._live(meta["id"]))
                 flags = {
                     "ecoli": r["ecoli"] > 0 and (prev is None or prev["ecoli"] == 0),
                     "chlorine": r["chlorine"] < 0.1 and (prev is None or prev["chlorine"] >= 0.1),
@@ -353,66 +369,79 @@ class Network:
         meta = st["meta"]
         series = []
         for r in list(st["history"])[-72:]:
-            ev = evaluate(meta, r)
+            ev = evaluate(meta, r, self._live(meta["id"]))
             series.append({"timestamp": r["timestamp"], "score": ev["score"], "chlorine": r["chlorine"],
                            "turbidity": r["turbidity"], "ecoli": r["ecoli"], "leak": ev["leak"],
                            "outbreak": ev["outbreak"], "flow": r["flow"], "pressure": r["pressure"]})
         return {"site": {**meta, "scenario": st["scenario"]}, "latest": self._site_card(st),
+                "live": self._live(site_id),
                 "series": series}
 
-    # ---- CSV ingest -------------------------------------------------------
+    # ---- ingest (CSV, JSON devices) ---------------------------------------
     REQUIRED = ("site_id", "timestamp", "ph", "turbidity", "do", "chlorine", "ecoli")
-    OPTIONAL = ("temperature", "flow", "pressure", "rainfall")
 
-    def ingest_csv(self, text: str) -> dict:
-        reader = csv.DictReader(io.StringIO(text))
-        if not reader.fieldnames:
-            raise ValueError("CSV has no header row")
-        fields = {f.strip().lower(): f for f in reader.fieldnames if f}
-        missing = [c for c in self.REQUIRED if c not in fields]
-        if missing:
-            raise ValueError(f"missing required columns: {', '.join(missing)}")
+    @staticmethod
+    def _opt(row: dict, key: str, default: float) -> float:
+        val = row.get(key)
+        return default if val in (None, "") else float(val)
 
-        accepted: list[tuple[str, dict]] = []
-        rejected: list[str] = []
-        for line_no, raw in enumerate(reader, start=2):
-            row = {k.strip().lower(): (v or "").strip() for k, v in raw.items() if k}
-            site_id = row.get("site_id", "")
-            if site_id not in self.sites:
-                rejected.append(f"line {line_no}: unknown site_id '{site_id}'")
-                continue
-            try:
-                ts = parse_ts(row["timestamp"])
-                r = {"timestamp": ts.isoformat()}
-                for key in ("ph", "turbidity", "do", "chlorine"):
-                    r[key] = float(row[key])
-                r["ecoli"] = int(float(row["ecoli"]))
-                meta = self.sites[site_id]["meta"]
-                exp = expected_values(meta, ts)
-                r["temperature"] = float(row["temperature"]) if row.get("temperature") else round(exp["temperature"], 1)
-                r["flow"] = float(row["flow"]) if row.get("flow") else round(exp["flow"], 1)
-                r["pressure"] = float(row["pressure"]) if row.get("pressure") else round(exp["pressure"], 2)
-                r["rainfall"] = float(row["rainfall"]) if row.get("rainfall") else 0.0
-            except (ValueError, KeyError) as exc:
-                rejected.append(f"line {line_no}: {exc}")
-                continue
-            accepted.append((site_id, r))
+    def _normalise(self, row: dict) -> tuple[str, dict]:
+        site_id = str(row.get("site_id", "")).strip()
+        if site_id not in self.sites:
+            raise ValueError(f"unknown site_id '{site_id}'")
+        ts = parse_ts(str(row.get("timestamp") or now_ist().isoformat()))
+        r = {"timestamp": ts.isoformat()}
+        for key in ("ph", "turbidity", "do", "chlorine"):
+            r[key] = float(row[key])
+        r["ecoli"] = int(float(row["ecoli"]))
+        exp = expected_values(self.sites[site_id]["meta"], ts)
+        r["temperature"] = self._opt(row, "temperature", round(exp["temperature"], 1))
+        r["flow"] = self._opt(row, "flow", round(exp["flow"], 1))
+        r["pressure"] = self._opt(row, "pressure", round(exp["pressure"], 2))
+        r["rainfall"] = self._opt(row, "rainfall", 0.0)
+        return site_id, r
 
-        analysis = []
+    def _commit(self, accepted: list[tuple[str, dict]], rejected: list[str]) -> dict:
         touched = set()
         for site_id, r in accepted:
-            st = self.sites[site_id]
-            st["history"].append(r)  # merged below in timestamp order
+            self.sites[site_id]["history"].append(r)
             touched.add(site_id)
         for site_id in touched:
             st = self.sites[site_id]
             ordered = sorted(st["history"], key=lambda x: parse_ts(x["timestamp"]))
             st["history"] = deque(ordered[-HISTORY_LEN:], maxlen=HISTORY_LEN)
+        analysis = []
         for site_id, r in accepted[:200]:
-            ev = evaluate(self.sites[site_id]["meta"], r)
+            ev = evaluate(self.sites[site_id]["meta"], r, self._live(site_id))
             analysis.append({"site_id": site_id, "site_name": self.sites[site_id]["meta"]["name"],
                              "timestamp": r["timestamp"], "score": ev["score"], "verdict": ev["verdict"],
                              "outbreak": ev["outbreak"], "leak": ev["leak"],
                              "top_issue": ev["insights"][0]["text"]})
         return {"accepted": len(accepted), "rejected": rejected[:20], "rejected_count": len(rejected),
                 "sites_updated": sorted(touched), "analysis": analysis}
+
+    def ingest_csv(self, text: str) -> dict:
+        reader = csv.DictReader(io.StringIO(text))
+        if not reader.fieldnames:
+            raise ValueError("CSV has no header row")
+        fields = {f.strip().lower() for f in reader.fieldnames if f}
+        missing = [c for c in self.REQUIRED if c not in fields]
+        if missing:
+            raise ValueError(f"missing required columns: {', '.join(missing)}")
+        accepted, rejected = [], []
+        for line_no, raw in enumerate(reader, start=2):
+            row = {k.strip().lower(): (v or "").strip() for k, v in raw.items() if k}
+            try:
+                accepted.append(self._normalise(row))
+            except (ValueError, KeyError) as exc:
+                rejected.append(f"line {line_no}: {exc}")
+        return self._commit(accepted, rejected)
+
+    def ingest_json(self, items: list[dict]) -> dict:
+        accepted, rejected = [], []
+        for i, row in enumerate(items, start=1):
+            try:
+                accepted.append(self._normalise({k.lower(): v for k, v in row.items()}))
+            except (ValueError, KeyError, TypeError) as exc:
+                rejected.append(f"item {i}: {exc}")
+        return self._commit(accepted, rejected)

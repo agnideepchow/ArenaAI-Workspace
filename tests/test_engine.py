@@ -56,3 +56,19 @@ def test_csv_ingest_accepts_valid_and_rejects_bad_rows():
     r = net.ingest_csv(csv_text)
     assert r["accepted"] == 1
     assert r["rejected_count"] == 2
+
+
+def test_json_device_ingest_scores_reading():
+    net = Network()
+    r = net.ingest_json([{"site_id": "vlr-01", "ph": 7.0, "turbidity": 0.4, "do": 6.5,
+                          "chlorine": 0.3, "ecoli": 0}])
+    assert r["accepted"] == 1 and r["rejected_count"] == 0
+
+
+def test_live_rainfall_raises_outbreak_risk():
+    from aquapulse.engine import SITES
+    meta = SITES[0]
+    r = Network().sites[meta["id"]]["history"][-1]
+    dry = evaluate(meta, r, {"rain_24h": 0.0})["outbreak"]
+    wet = evaluate(meta, r, {"rain_24h": 30.0, "river_trend": "rising"})["outbreak"]
+    assert wet > dry
