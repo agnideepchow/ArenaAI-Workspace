@@ -3,7 +3,8 @@
 Uses Open-Meteo (free, no API key required):
   * weather + rainfall (forecast API)
   * river discharge (GloFAS flood API), where a river grid cell exists
-The feed refreshes in a background thread and never blocks the dashboard.
+The server refreshes in a background thread. If the server cannot reach Open-Meteo,
+the browser can relay the same data through POST /api/live/push.
 """
 from __future__ import annotations
 
@@ -16,6 +17,8 @@ import urllib.request
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 FLOOD_URL = "https://flood-api.open-meteo.com/v1/flood"
+FRESH_SECONDS = 1800  # data older than 30 min is treated as stale
+IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 
 
 class LiveFeed:
@@ -24,11 +27,10 @@ class LiveFeed:
         self.ttl = ttl
         self._lock = threading.Lock()
         self._data: dict[str, dict] = {}
-        self._updated: str | None = None
+        self._updated_ts: float | None = None
+        self._source = "Open-Meteo (weather, rainfall, river discharge)"
         self._error: str | None = None
-        self._ok = False
 
-    # ---- HTTP -----------------------------------------------------------
     @staticmethod
     def _get(url: str, params: dict):
         query = urllib.parse.urlencode(params)
@@ -36,7 +38,6 @@ class LiveFeed:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
 
-    # ---- refresh --------------------------------------------------------
     def refresh(self) -> bool:
         lat = ",".join(str(s["lat"]) for s in self.sites)
         lon = ",".join(str(s["lon"]) for s in self.sites)
@@ -47,10 +48,9 @@ class LiveFeed:
                 "hourly": "precipitation", "past_days": 1, "forecast_days": 1,
                 "timezone": "Asia/Kolkata",
             })
-        except Exception as exc:  # network down, rate limit, etc.
+        except Exception as exc:
             with self._lock:
-                self._error = f"weather feed unavailable: {exc}"
-                self._ok = False
+                self._error = f"weather feed unavailable from server: {exc}"
             return False
 
         items = weather if isinstance(weather, list) else [weather]
@@ -59,7 +59,8 @@ class LiveFeed:
             cur = item.get("current", {})
             hourly = item.get("hourly", {})
             times, precip = hourly.get("time") or [], hourly.get("precipitation") or []
-            idx = max((i for i, t in enumerate(times) if t[:13] == str(cur.get("time", ""))[:13]), default=len(times) - 1)
+            idx = max((i for i, t in enumerate(times) if t[:13] == str(cur.get("time", ""))[:13]),
+                      default=len(times) - 1)
             window = [p or 0.0 for p in precip[max(0, idx - 23): idx + 1]]
             fresh[site["id"]] = {
                 "temperature": cur.get("temperature_2m"),
@@ -68,8 +69,6 @@ class LiveFeed:
                 "river_discharge": None, "river_trend": None,
                 "observed_at": cur.get("time"),
             }
-
-        # River discharge: per-site, best effort (None for non-river locations)
         for site in self.sites:
             try:
                 flood = self._get(FLOOD_URL, {
@@ -85,25 +84,35 @@ class LiveFeed:
                         "rising" if last > prev * 1.1 else "falling" if last < prev * 0.9 else "steady")
             except Exception:
                 pass
-
-        with self._lock:
-            self._data = fresh
-            self._updated = dt.datetime.now(dt.timezone(dt.timedelta(hours=5, minutes=30))).isoformat(timespec="minutes")
-            self._error = None
-            self._ok = True
+        self._store(fresh, "Open-Meteo (fetched by server)")
         return True
+
+    def set_external(self, data: dict[str, dict]) -> None:
+        """Accept live data relayed from the browser (same shape as refresh())."""
+        known = {s["id"] for s in self.sites}
+        clean = {k: v for k, v in data.items() if k in known and isinstance(v, dict)}
+        if clean:
+            self._store(clean, "Open-Meteo (relayed from your browser)")
+
+    def _store(self, data: dict, source: str) -> None:
+        with self._lock:
+            self._data = data
+            self._updated_ts = time.time()
+            self._source = source
+            self._error = None
 
     def loop(self) -> None:
         while True:
             self.refresh()
             time.sleep(self.ttl)
 
-    # ---- read side ------------------------------------------------------
     def site(self, site_id: str) -> dict | None:
         with self._lock:
             return dict(self._data[site_id]) if site_id in self._data else None
 
     def status(self) -> dict:
         with self._lock:
-            return {"source": "Open-Meteo (weather, rainfall, river discharge)", "ok": self._ok,
-                    "updated": self._updated, "error": self._error, "sites": len(self._data)}
+            fresh = self._updated_ts is not None and self._data and time.time() - self._updated_ts < FRESH_SECONDS
+            updated = dt.datetime.fromtimestamp(self._updated_ts, IST).isoformat(timespec="minutes") if self._updated_ts else None
+            return {"source": self._source, "ok": bool(fresh), "updated": updated,
+                    "error": self._error, "sites": len(self._data)}

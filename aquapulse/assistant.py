@@ -12,7 +12,9 @@ from . import config
 
 
 class AssistantError(RuntimeError):
-    pass
+    def __init__(self, message: str, unreachable: bool = False):
+        super().__init__(message)
+        self.unreachable = unreachable
 
 
 SYSTEM_PROMPT = """You are AquaPulse Assistant, an expert in drinking-water safety, sanitation and
@@ -57,6 +59,10 @@ def build_snapshot(overview: dict) -> str:
     return "\n".join(lines)
 
 
+def system_text(snapshot: str) -> str:
+    return f"{SYSTEM_PROMPT}\n\nNETWORK SNAPSHOT:\n{snapshot}"
+
+
 def ask(messages: list[dict], snapshot: str) -> str:
     key = config.get("GEMINI_API_KEY")
     if not key:
@@ -73,7 +79,7 @@ def ask(messages: list[dict], snapshot: str) -> str:
         raise AssistantError("Empty question.")
 
     body = {
-        "systemInstruction": {"parts": [{"text": f"{SYSTEM_PROMPT}\n\nNETWORK SNAPSHOT:\n{snapshot}"}]},
+        "systemInstruction": {"parts": [{"text": system_text(snapshot)}]},
         "contents": contents,
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": 900},
     }
@@ -87,7 +93,9 @@ def ask(messages: list[dict], snapshot: str) -> str:
         detail = exc.read().decode("utf-8", "ignore")[:300]
         raise AssistantError(f"Gemini returned HTTP {exc.code}: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise AssistantError(f"Could not reach Gemini: {exc.reason}") from exc
+        raise AssistantError(f"Could not reach Gemini from the server: {exc.reason}", unreachable=True) from exc
+    except (TimeoutError, OSError) as exc:
+        raise AssistantError(f"Could not reach Gemini from the server: {exc}", unreachable=True) from exc
 
     try:
         text = "".join(part.get("text", "") for part in data["candidates"][0]["content"]["parts"]).strip()

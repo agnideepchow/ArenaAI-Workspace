@@ -10,7 +10,11 @@ const fmtTime = (iso) => new Date(iso).toLocaleString("en-IN", { day: "2-digit",
 async function api(path, opts = {}) {
   const res = await fetch(path, { ...opts, headers: opts.body && !(opts.body instanceof FormData) ? { "Content-Type": "application/json" } : {} });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  if (!res.ok) {
+    const err = new Error(data.error || res.statusText);
+    err.unreachable = !!data.unreachable;
+    throw err;
+  }
   return data;
 }
 function toast(msg) {
@@ -22,6 +26,7 @@ function toast(msg) {
 }
 
 /* ---------- map ---------- */
+let lastLivePush = 0;
 let appConfig = { geoapify_key: "", assistant_ready: false, assistant_model: "" };
 async function initMap() {
   try { appConfig = await api("/api/config"); } catch (e) { console.warn(e); }
@@ -146,6 +151,7 @@ async function loadOverview() {
   scenarios = data.scenarios;
   lastSites = data.sites;
   renderFeed(data.feed);
+  maybeRelay(data.feed, data.sites);
   renderKpis(data.kpis);
   updateMarkers(data.sites);
   renderAlerts(data.alerts);
@@ -154,6 +160,58 @@ async function loadOverview() {
     map.fitBounds(data.sites.map((s) => [s.lat, s.lon]), { padding: [40, 40] });
     map._fitted = true;
   }
+  if (selectedId) await selectSite(selectedId, true);
+}
+
+/* ---------- live data relay (browser -> Open-Meteo -> server) ---------- */
+async function fetchLiveFromBrowser(sites) {
+  const q = new URLSearchParams({
+    latitude: sites.map((s) => s.lat).join(","), longitude: sites.map((s) => s.lon).join(","),
+    current: "temperature_2m,precipitation,rain", hourly: "precipitation",
+    past_days: "1", forecast_days: "1", timezone: "Asia/Kolkata",
+  });
+  const w = await (await fetch("https://api.open-meteo.com/v1/forecast?" + q)).json();
+  const items = Array.isArray(w) ? w : [w];
+  const out = {};
+  items.forEach((item, i) => {
+    const site = sites[i], cur = item.current || {};
+    const times = item.hourly?.time || [], precip = item.hourly?.precipitation || [];
+    let idx = times.length - 1;
+    times.forEach((t, k) => { if (t.slice(0, 13) === String(cur.time || "").slice(0, 13)) idx = k; });
+    const windowVals = precip.slice(Math.max(0, idx - 23), idx + 1).map((v) => v || 0);
+    out[site.id] = {
+      temperature: cur.temperature_2m ?? null, rain_now: cur.precipitation ?? null,
+      rain_24h: windowVals.length ? Math.round(windowVals.reduce((a, b) => a + b, 0) * 10) / 10 : null,
+      river_discharge: null, river_trend: null, observed_at: cur.time ?? null,
+    };
+  });
+  await Promise.all(sites.map(async (s) => {
+    try {
+      const f = await (await fetch("https://flood-api.open-meteo.com/v1/flood?" + new URLSearchParams({
+        latitude: s.lat, longitude: s.lon, daily: "river_discharge", past_days: "5", forecast_days: "1" }))).json();
+      const series = (f.daily?.river_discharge || []).filter((v) => v != null);
+      if (series.length) {
+        const last = series[series.length - 1], prev = series.length >= 4 ? series[series.length - 4] : series[0];
+        out[s.id].river_discharge = Math.round(last * 10) / 10;
+        out[s.id].river_trend = last > prev * 1.1 ? "rising" : last < prev * 0.9 ? "falling" : "steady";
+      }
+    } catch (e) { /* river data is optional */ }
+  }));
+  return out;
+}
+async function relayLiveFromBrowser(sites) {
+  const data = await fetchLiveFromBrowser(sites);
+  await api("/api/live/push", { method: "POST", body: JSON.stringify({ sites: data }) });
+}
+function maybeRelay(feed, sites) {
+  // If the server cannot reach Open-Meteo, the browser relays fresh data every ~9 minutes.
+  if (!feed || feed.ok || Date.now() - lastLivePush < 9 * 60 * 1000) return;
+  lastLivePush = Date.now();
+  relayLiveFromBrowser(sites).then(() => loadOverviewQuiet()).catch((e) => console.warn("live relay", e));
+}
+async function loadOverviewQuiet() {
+  const data = await api("/api/overview");
+  lastSites = data.sites; renderFeed(data.feed); renderKpis(data.kpis); updateMarkers(data.sites); renderSites(data.sites);
   if (selectedId) await selectSite(selectedId, true);
 }
 
@@ -247,6 +305,7 @@ async function inject(siteId, scenario) {
 }
 async function tick() {
   const data = await api("/api/tick", { method: "POST" });
+  renderFeed(data.feed); maybeRelay(data.feed, data.sites);
   lastSites = data.sites;
   renderKpis(data.kpis); updateMarkers(data.sites); renderAlerts(data.alerts); renderSites(data.sites);
   if (selectedId) await selectSite(selectedId, true);
@@ -339,10 +398,10 @@ async function sendChat(text) {
   const typing = addMsg("bot", `<span class="typing"><i></i><i></i><i></i></span>`);
   $("#chatSend").disabled = true;
   try {
-    const r = await api("/api/chat", { method: "POST", body: JSON.stringify({ messages: chatHistory }) });
+    const reply = await askAssistant(chatHistory);
     typing.remove();
-    addMsg("bot", r.reply);
-    chatHistory.push({ role: "assistant", content: r.reply });
+    addMsg("bot", reply);
+    chatHistory.push({ role: "assistant", content: reply });
   } catch (err) {
     typing.remove();
     addMsg("error", err.message, "error");
@@ -377,6 +436,29 @@ document.addEventListener("DOMContentLoaded", async () => {
   try { await loadOverview(); }
   catch (e) { toast("Could not load data: " + e.message); }
 });
+
+async function askAssistant(messages) {
+  try {
+    return (await api("/api/chat", { method: "POST", body: JSON.stringify({ messages }) })).reply;
+  } catch (err) {
+    // Server could not reach Gemini: call it from the browser with the same grounded context.
+    if (!err.unreachable || !appConfig.gemini_browser_key) throw err;
+    const ctx = await api("/api/chat-context");
+    const contents = messages.slice(-12).map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: String(m.content).slice(0, 4000) }] }));
+    while (contents.length && contents[0].role !== "user") contents.shift();
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${ctx.model}:generateContent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": appConfig.gemini_browser_key },
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: ctx.system }] }, contents,
+        generationConfig: { temperature: 0.4, maxOutputTokens: 900 } }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(`Gemini error ${res.status}: ${data.error?.message || ""}`);
+    const text = (data.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+    if (!text) throw new Error("Gemini returned no answer (possibly blocked by a safety filter).");
+    return text;
+  }
+}
 
 function appConfigReadyMessage() {
   return "Hi! I'm the AquaPulse Assistant. Ask me about any source, alert or live condition. I answer from the current dashboard data.";

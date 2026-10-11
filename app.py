@@ -20,6 +20,15 @@ def _with_live():
     net.set_live({s["id"]: feed.site(s["id"]) for s in SITES if feed.site(s["id"])})
 
 
+def _browser_fallback_enabled() -> bool:
+    return config.get("GEMINI_BROWSER_FALLBACK", "true").lower() == "true"
+
+
+def _snapshot_text() -> str:
+    _with_live()
+    return assistant.build_snapshot({**net.overview(), "feed": feed.status()})
+
+
 @app.get("/")
 def index():
     return render_template("index.html")
@@ -27,10 +36,15 @@ def index():
 
 @app.get("/api/config")
 def public_config():
-    # Geoapify tile key is required by the browser map; the Gemini key never leaves the server.
-    return jsonify(geoapify_key=config.get("GEOAPIFY_API_KEY"),
-                   assistant_ready=assistant.is_configured(),
-                   assistant_model=config.get("GEMINI_MODEL", "gemini-2.5-flash"))
+    # The Geoapify key is needed by the browser to load map tiles.
+    # The Gemini key is only exposed when the browser fallback is enabled in .env.
+    key = config.get("GEMINI_API_KEY")
+    return jsonify(
+        geoapify_key=config.get("GEOAPIFY_API_KEY"),
+        assistant_ready=assistant.is_configured(),
+        assistant_model=config.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        gemini_browser_key=key if (key and _browser_fallback_enabled()) else "",
+    )
 
 
 @app.get("/api/overview")
@@ -57,7 +71,9 @@ def tick():
     with lock:
         net.tick()
         _with_live()
-        return jsonify(net.overview())
+        data = net.overview()
+        data["feed"] = feed.status()
+        return jsonify(data)
 
 
 @app.post("/api/inject")
@@ -76,7 +92,9 @@ def reset():
     with lock:
         net.reset()
         _with_live()
-        return jsonify(net.overview())
+        data = net.overview()
+        data["feed"] = feed.status()
+        return jsonify(data)
 
 
 @app.post("/api/upload")
@@ -106,6 +124,26 @@ def ingest_device():
         return jsonify(net.ingest_json(items))
 
 
+@app.post("/api/live/push")
+def live_push():
+    """Browser relays Open-Meteo data when the server cannot reach it."""
+    body = request.get_json(silent=True) or {}
+    data = body.get("sites") or {}
+    if not isinstance(data, dict):
+        return jsonify(error="expected {sites: {site_id: {...}}}"), 400
+    feed.set_external(data)
+    return jsonify(feed.status())
+
+
+@app.get("/api/chat-context")
+def chat_context():
+    """System prompt + live snapshot, used when the browser calls Gemini directly."""
+    with lock:
+        snapshot = _snapshot_text()
+    return jsonify(system=assistant.system_text(snapshot), snapshot=snapshot,
+                   model=config.get("GEMINI_MODEL", "gemini-2.5-flash"))
+
+
 @app.post("/api/chat")
 def chat():
     body = request.get_json(silent=True) or {}
@@ -113,15 +151,13 @@ def chat():
     if not messages:
         return jsonify(error="no messages"), 400
     if not assistant.is_configured():
-        return jsonify(error="The AI assistant is not configured yet. Add GEMINI_API_KEY to the .env file "
-                             "and restart the server."), 503
+        return jsonify(error="The AI assistant is not configured. Add GEMINI_API_KEY to .env and restart."), 503
     with lock:
-        _with_live()
-        snapshot = assistant.build_snapshot({**net.overview(), "feed": feed.status()})
+        snapshot = _snapshot_text()
     try:
         return jsonify(reply=assistant.ask(messages, snapshot))
     except assistant.AssistantError as exc:
-        return jsonify(error=str(exc)), 502
+        return jsonify(error=str(exc), unreachable=exc.unreachable), 502
 
 
 if __name__ == "__main__":
